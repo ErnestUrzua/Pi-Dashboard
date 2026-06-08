@@ -17,7 +17,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "wayland")
 
 DISPLAY_W = 1024
 DISPLAY_H = 600
-FPS       = 15
+FPS       = 60
 
 # Bezel margins matching labwc rc.xml
 MARGIN_LEFT   = 26
@@ -33,7 +33,7 @@ CONTENT_X = MARGIN_LEFT + (DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT - CONTENT_W) /
 CONTENT_Y = MARGIN_TOP  + (DISPLAY_H - MARGIN_TOP  - MARGIN_BOTTOM - CONTENT_H) // 2
 
 BG_COLOR     = (6, 0, 18)
-BORDER_COLOR = (140, 20, 190)
+BORDER_COLOR = (200, 60, 255)
 TEXT_COLOR   = (215, 160, 255)
 DIM_COLOR    = (90, 50, 120)
 
@@ -84,12 +84,15 @@ def psu_monitor_thread():
 
 
 def read_adc_channel(bus, ch):
-    import smbus2
     mux  = MUX_SINGLE[ch]
     high = (1 << 7) | (mux << 4) | (PGA_GAIN << 1) | 1
     low  = 0b11100011  # 860 SPS
     bus.write_i2c_block_data(ADC_ADDR, 0x01, [high, low])
-    time.sleep(0.002)
+    # Poll OS bit — avoids inaccurate sleep; conversion done when bit goes high
+    for _ in range(30):
+        cfg = bus.read_i2c_block_data(ADC_ADDR, 0x01, 2)
+        if cfg[0] & 0x80:
+            break
     data = bus.read_i2c_block_data(ADC_ADDR, 0x00, 2)
     raw  = (data[0] << 8) | data[1]
     if raw > 32767:
@@ -109,7 +112,7 @@ def sensor_thread(bus):
                     readings[ch] = v
         except Exception as e:
             print(f"ADC error: {e}", file=sys.stderr)
-            time.sleep(0.05)
+        time.sleep(0.033)  # ~30Hz poll rate
 
 
 def volt_color(v):
@@ -247,96 +250,81 @@ def draw_vu_panel(surface, fonts, rect, label, volts):
     pct   = max(0.0, min(1.0, (volts - MIN_V) / (MAX_V - MIN_V)))
 
     # Panel shell
-    pygame.draw.rect(surface, (14, 0, 26), rect, border_radius=14)
-    pygame.draw.rect(surface, color, rect, 2, border_radius=14)
+    pygame.draw.rect(surface, (4, 0, 8), rect, border_radius=14)
+    pygame.draw.rect(surface, (200, 60, 255), rect, 2, border_radius=14)
 
-    # Meter face
-    fm   = 10
-    face = pygame.Rect(rect.x + fm, rect.y + fm, rect.w - fm * 2, rect.h - fm * 2)
-    pygame.draw.rect(surface, (10, 3, 22), face, border_radius=10)
-    pygame.draw.rect(surface, (80, 30, 110), face, 1, border_radius=10)
+    # Circular face — center slightly above mid to leave room for label
+    face_r = rect.w // 2 - 8
+    cy     = rect.y + face_r + 10
+    pygame.draw.circle(surface, (4, 0, 10), (cx, cy), face_r)
+    pygame.draw.circle(surface, (50, 20, 70), (cx, cy), face_r, 2)
 
-    # Geometry
-    pivot_x = cx
-    pivot_y = face.y + int(face.h * 0.76)
-    arc_r   = min(face.w // 2 - 4, int(face.h * 0.60))
-    SWEEP   = 130.0          # total sweep in degrees
-    A_START = -SWEEP / 2.0   # -65° from straight up
+    # Arc geometry — 210° sweep, bottom-left to bottom-right through top
+    N_LEDS  = 10
+    SWEEP   = 210.0
+    A_START = -SWEEP / 2.0        # degrees from straight up
+    led_r   = int(face_r * 0.76)
+    arc_length = 2 * math.pi * led_r * (SWEEP / 360.0)
+    spacing    = arc_length / (N_LEDS - 1)
+    dot_outer  = max(4, int(spacing * 0.30 * 0.75))
+    dot_inner  = max(2, dot_outer - 2)
+    lit_count  = int(round(pct * N_LEDS))
 
-    # Colored arc bands: red=low, yellow=mid, green=high
-    arc_rect = pygame.Rect(pivot_x - arc_r, pivot_y - arc_r, arc_r * 2, arc_r * 2)
-    band_w   = 7
-    for z0, z1, zcol in [(0.00, 0.35, (200, 40, 40)),
-                          (0.35, 0.65, (200, 150, 0)),
-                          (0.65, 1.00, (0, 190, 80))]:
-        pg_s = math.radians(90 - (A_START + z1 * SWEEP))
-        pg_e = math.radians(90 - (A_START + z0 * SWEEP))
-        pygame.draw.arc(surface, zcol, arc_rect, pg_s, pg_e, band_w)
+    # Thin arc track
+    arc_rect = pygame.Rect(cx - led_r, cy - led_r, led_r * 2, led_r * 2)
+    pg_s = math.radians(90 - (A_START + SWEEP))
+    pg_e = math.radians(90 - A_START)
+    pygame.draw.arc(surface, (0, 60, 25), arc_rect, pg_s, pg_e, 1)
 
-    # Major ticks + voltage labels
-    N_MAJ = 7
-    for i in range(N_MAJ):
-        t       = i / (N_MAJ - 1)
-        ang_rad = math.radians(A_START + t * SWEEP)
-        tc      = (200,40,40) if t < 0.35 else ((200,150,0) if t < 0.65 else (0,190,80))
+    label_r = led_r - dot_outer - 13
 
-        outer_r = arc_r - band_w - 1
-        inner_r = arc_r - band_w - 13
-        ox = pivot_x + int(outer_r * math.sin(ang_rad))
-        oy = pivot_y - int(outer_r * math.cos(ang_rad))
-        ix = pivot_x + int(inner_r * math.sin(ang_rad))
-        iy = pivot_y - int(inner_r * math.cos(ang_rad))
-        pygame.draw.line(surface, tc, (ox, oy), (ix, iy), 2)
+    for i in range(N_LEDS):
+        t       = i / (N_LEDS - 1)
+        ang_deg = A_START + t * SWEEP
+        ang_rad = math.radians(ang_deg)
+        lx      = cx + int(led_r * math.sin(ang_rad))
+        ly      = cy - int(led_r * math.cos(ang_rad))
 
-        v     = MIN_V + t * (MAX_V - MIN_V)
-        lr    = arc_r - band_w - 24
-        lx    = pivot_x + int(lr * math.sin(ang_rad))
-        ly    = pivot_y - int(lr * math.cos(ang_rad))
-        v_lbl = font_sm.render(f"{v:.1f}", True, tc)
-        surface.blit(v_lbl, (lx - v_lbl.get_width() // 2,
-                              ly - v_lbl.get_height() // 2))
+        base = (0, 255, 90)
 
-        # Minor ticks between majors
-        if i < N_MAJ - 1:
-            for j in range(1, 4):
-                mt      = t + (j / 4.0) * (1.0 / (N_MAJ - 1))
-                ma_rad  = math.radians(A_START + mt * SWEEP)
-                mo_r    = arc_r - band_w - 1
-                mi_r    = arc_r - band_w - 7
-                pygame.draw.line(surface, (70, 35, 95),
-                                 (pivot_x + int(mo_r * math.sin(ma_rad)),
-                                  pivot_y - int(mo_r * math.cos(ma_rad))),
-                                 (pivot_x + int(mi_r * math.sin(ma_rad)),
-                                  pivot_y - int(mi_r * math.cos(ma_rad))), 1)
+        lit = i < lit_count
 
-    # Needle
-    ndl_rad = math.radians(A_START + pct * SWEEP)
-    ndl_r   = arc_r - band_w - 2
-    tip_x   = pivot_x + int(ndl_r * math.sin(ndl_rad))
-    tip_y   = pivot_y - int(ndl_r * math.cos(ndl_rad))
-    tail_r  = 18
-    tail_x  = pivot_x - int(tail_r * math.sin(ndl_rad))
-    tail_y  = pivot_y + int(tail_r * math.cos(ndl_rad))
+        # Short radial line from track inward to LED
+        line_r = led_r - dot_outer - 3
+        lline_x = cx + int(line_r * math.sin(ang_rad))
+        lline_y = cy - int(line_r * math.cos(ang_rad))
+        dim  = (base[0]//2, base[1]//2, base[2]//2)
+        col  = base if lit else dim
+        halo = (base[0]//4, base[1]//4, base[2]//4) if lit else (base[0]//8, base[1]//8, base[2]//8)
 
-    pygame.draw.line(surface, (color[0]//4, color[1]//4, color[2]//4),
-                     (tail_x+1, tail_y+1), (tip_x+1, tip_y+1), 3)
-    pygame.draw.line(surface, color, (tail_x, tail_y), (tip_x, tip_y), 2)
+        # halo glow behind dot
+        pygame.draw.circle(surface, halo, (lx, ly), dot_outer + 4)
+        pygame.draw.line(surface, col, (lx, ly), (lline_x, lline_y), 1)
+        pygame.draw.circle(surface, col, (lx, ly), dot_outer, 2)
+        pygame.draw.circle(surface, col, (lx, ly), dot_inner)
 
-    # Pivot hub
-    pygame.draw.circle(surface, (100, 50, 140), (pivot_x, pivot_y), 7)
-    pygame.draw.circle(surface, color,           (pivot_x, pivot_y), 5)
-    pygame.draw.circle(surface, (10, 3, 22),     (pivot_x, pivot_y), 2)
+        # Radial voltage label — every other LED
+        if True:
+            v     = MIN_V + t * (MAX_V - MIN_V)
+            lbx   = cx + int(label_r * math.sin(ang_rad))
+            lby   = cy - int(label_r * math.cos(ang_rad))
+            tc    = (0, 200, 70)
+            lbl_s = font_sm.render(f"{v:.2f}", True, tc)
+            rot_s = pygame.transform.rotate(lbl_s, -ang_deg)
+            surface.blit(rot_s, (lbx - rot_s.get_width() // 2,
+                                 lby - rot_s.get_height() // 2))
 
-    # "VU" label top-left, voltage top-center
-    vu_s = font_md.render("VU", True, TEXT_COLOR)
-    surface.blit(vu_s, (face.x + 8, face.y + 8))
-    v_s = font_md.render(f"{volts:.2f}V", True, color)
-    surface.blit(v_s, (cx - v_s.get_width() // 2, face.y + 8))
-
-    # Battery label at bottom
-    lbl_s = font_sm.render(label, True, DIM_COLOR)
-    surface.blit(lbl_s, (cx - lbl_s.get_width() // 2,
-                          face.bottom - lbl_s.get_height() - 6))
+    # Voltage + label stacked below the arc
+    v_s  = font_lg.render(f"{volts:.2f}", True, color)
+    u_s  = font_md.render("V", True, DIM_COLOR)
+    lbl  = font_sm.render(label, True, DIM_COLOR)
+    below_y = cy + face_r + 6
+    vx   = cx - (v_s.get_width() + u_s.get_width() + 3) // 2
+    surface.blit(v_s,  (vx, below_y))
+    surface.blit(u_s,  (vx + v_s.get_width() + 3,
+                         below_y + v_s.get_height() - u_s.get_height() - 2))
+    surface.blit(lbl,  (cx - lbl.get_width() // 2,
+                         below_y + v_s.get_height() + 2))
 
 
 def main():
@@ -438,10 +426,6 @@ def main():
         thr_col = (255, 40, 40) if thr_now else ((255, 160, 0) if thr_hist else (0, 200, 100))
         thr_txt = "THR: NOW" if thr_now else ("THR: HIST" if thr_hist else "THR: OK")
 
-        psu_s = font_sm.render(psu_txt, True, psu_col)
-        thr_s = font_sm.render(thr_txt, True, thr_col)
-        canvas.blit(psu_s, (CONTENT_W - psu_s.get_width() - thr_s.get_width() - 18, 14))
-        canvas.blit(thr_s, (CONTENT_W - thr_s.get_width() - 6, 14))
 
         # Panels
         for i, (rect, label) in enumerate(zip(panels, BATTERIES)):
@@ -471,6 +455,14 @@ def main():
 
         switcher.update()
         switcher.draw(canvas, font_sm)
+
+        # PSU/throttle — drawn last so switcher doesn't cover it
+        psu_s = font_sm.render(psu_txt, True, psu_col)
+        thr_s = font_sm.render(thr_txt, True, thr_col)
+        canvas.blit(thr_s, (CONTENT_W - thr_s.get_width() - 8,
+                             NAV_Y + (34 - thr_s.get_height()) // 2))
+        canvas.blit(psu_s, (CONTENT_W - thr_s.get_width() - psu_s.get_width() - 16,
+                             NAV_Y + (34 - psu_s.get_height()) // 2))
 
         screen.blit(canvas, (CONTENT_X, CONTENT_Y))
         pygame.display.flip()

@@ -36,10 +36,8 @@ CONTENT_X = MARGIN_LEFT + (DISPLAY_W - MARGIN_LEFT - MARGIN_RIGHT - CONTENT_W) /
 CONTENT_Y = MARGIN_TOP  + (DISPLAY_H - MARGIN_TOP  - MARGIN_BOTTOM - CONTENT_H) // 2
 HISTORY      = 100    # trail length (~1s at 100Hz)
 G_SCALE      = 16384.0
-G_MIN        = -1.5
-G_MAX        =  1.5
-SENSITIVITY  =  2.0   # scale factor applied after calibration — increase to amplify movement
-sensitivity  = [SENSITIVITY]  # mutable so buttons can adjust at runtime
+G_MIN        = -1.0
+G_MAX        =  1.0
 CAL_FILE     = '/home/pi/.config/accel_cal.json'
 MARGIN       = 55
 PLOT_SIZE    = min(CONTENT_W, CONTENT_H) - MARGIN * 2   # square plot
@@ -113,11 +111,11 @@ def sensor_thread():
             rz = read_word_2c(ACCEL_XOUT_H + 4)
             with data_lock:
                 ox, oy, oz = cal_offset['x'], cal_offset['y'], cal_offset['z']
-            x_val = (-(ry / G_SCALE) - ox) * sensitivity[0]
-            y_val = ( (rx / G_SCALE) - oy) * sensitivity[0]
+            x_val = -(ry / G_SCALE) - ox
+            y_val =  (rx / G_SCALE) - oy
             latest['x'] = -y_val   # 90° CCW
             latest['y'] =  x_val   # 90° CCW
-            latest['z'] = ( (rz / G_SCALE) - oz) * sensitivity[0]
+            latest['z'] =  (rz / G_SCALE) - oz
             ex += TRAIL_ALPHA * (latest['x'] - ex)
             ey += TRAIL_ALPHA * (latest['y'] - ey)
             ez += TRAIL_ALPHA * (latest['z'] - ez)
@@ -173,13 +171,35 @@ def lerp_color(a, b, t):
 
 
 def draw_grid(surface, font, w, h):
+    plot_rect = pygame.Rect(MARGIN + PLOT_X_OFF, MARGIN, PLOT_SIZE, PLOT_SIZE)
+    old_clip  = surface.get_clip()
+    surface.set_clip(plot_rect)
+
+    # Fine phosphor grid at 0.1g intervals
+    FINE_STEP = 0.1
+    g = G_MIN
+    while g <= G_MAX + 0.001:
+        sy = g_to_sy(g, h)
+        sx = g_to_sx(g, w)
+        is_major = abs(round(g, 1)) % 0.5 < 0.01
+        col = (0, 110, 35) if is_major else (0, 65, 20)
+        pygame.draw.line(surface, col,
+                         (MARGIN + PLOT_X_OFF, sy),
+                         (MARGIN + PLOT_X_OFF + PLOT_SIZE, sy))
+        pygame.draw.line(surface, col,
+                         (sx, MARGIN),
+                         (sx, MARGIN + PLOT_SIZE))
+        g = round(g + FINE_STEP, 2)
+
+    surface.set_clip(old_clip)
+
     # plot border
     px = MARGIN + PLOT_X_OFF - 2
     py = MARGIN - 2
     pygame.draw.rect(surface, BORDER_COLOR,
                      (px, py, PLOT_SIZE + 4, PLOT_SIZE + 4), 1)
 
-    for g in (G_MIN, -1.0, 0.0, 1.0, G_MAX):
+    for g in (G_MIN, 0.0, G_MAX):
         sy = g_to_sy(g, h)
         sx = g_to_sx(g, w)
         col = AXIS_COLOR if g == 0.0 else GRID_COLOR
@@ -192,10 +212,19 @@ def draw_grid(surface, font, w, h):
 
     cx0 = g_to_sx(0, w)
     cy0 = g_to_sy(0, h)
-    surface.blit(font.render("ROLL →",   True, X_COLOR), (w - MARGIN - 50, cy0 - 18))
-    surface.blit(font.render("← ROLL",   True, X_COLOR), (MARGIN + 4,      cy0 - 18))
-    surface.blit(font.render("BRAKE ↑",  True, Y_COLOR), (cx0 + 6, MARGIN - 4))
-    surface.blit(font.render("ACCEL ↓",  True, Y_COLOR), (cx0 + 6, h - MARGIN + 4))
+    plot_left  = MARGIN + PLOT_X_OFF
+    plot_right = MARGIN + PLOT_X_OFF + PLOT_SIZE
+    plot_top   = MARGIN
+    plot_bot   = MARGIN + PLOT_SIZE
+
+    roll_r = font.render("ROLL →",  True, X_COLOR)
+    roll_l = font.render("← ROLL",  True, X_COLOR)
+    brake  = font.render("BRAKE ↑", True, Y_COLOR)
+    accel  = font.render("ACCEL ↓", True, Y_COLOR)
+    surface.blit(roll_r, (plot_right - roll_r.get_width() - 4, cy0 - roll_r.get_height() - 2))
+    surface.blit(roll_l, (plot_left + 4,                       cy0 - roll_l.get_height() - 2))
+    surface.blit(brake,  (cx0 - brake.get_width() // 2,        plot_top + 2))
+    surface.blit(accel,  (cx0 - accel.get_width() // 2,        plot_bot - accel.get_height() - 2))
 
     # Concentric g-force rings at 0.5g intervals — clipped to square plot boundary
     px_per_g = PLOT_SIZE / (G_MAX - G_MIN)
@@ -222,8 +251,9 @@ def draw_grid(surface, font, w, h):
             break
         col = AXIS_COLOR if g_ring == 1.0 else RING_COLOR
         lbl = font.render(f"{g_ring:.1f}g", True, col)
-        lx  = min(cx0 + r + 3, MARGIN + PLOT_X_OFF + PLOT_SIZE - lbl.get_width() - 2)
-        surface.blit(lbl, (lx, cy0 - lbl.get_height() // 2))
+        lx = cx0 + int(r * 0.707) + 3
+        ly = cy0 - int(r * 0.707) - lbl.get_height()
+        surface.blit(lbl, (lx, ly))
         g_ring += 0.5
 
 
@@ -371,10 +401,8 @@ def main():
 
     switcher      = CardSwitcher(__file__, CONTENT_W, CONTENT_H)
     NAV_Y         = CONTENT_H - 34
-    nav_home_rect = pygame.Rect(6,   NAV_Y + 3, 76, 28)
-    nav_cal_rect  = pygame.Rect(90,  NAV_Y + 3, 60, 28)
-    nav_sminus    = pygame.Rect(162, NAV_Y + 3, 32, 28)
-    nav_splus     = pygame.Rect(224, NAV_Y + 3, 32, 28)
+    nav_home_rect = pygame.Rect(6,  NAV_Y + 3, 76, 28)
+    nav_cal_rect  = pygame.Rect(90, NAV_Y + 3, 60, 28)
     cal_status    = {'msg': '', 'until': 0.0}
 
     def quit_app():
@@ -399,14 +427,6 @@ def main():
         if time.monotonic() < cal_status['until']:
             msg = font.render(cal_status['msg'], True, Y_COLOR)
             surface.blit(msg, (nav_cal_rect.x + nav_cal_rect.w + 8, nav_cal_rect.y + 7))
-        for rect, lbl in ((nav_sminus, 'S-'), (nav_splus, 'S+')):
-            pygame.draw.rect(surface, (0, 30, 10), rect, border_radius=5)
-            pygame.draw.rect(surface, BORDER_COLOR, rect, 1, border_radius=5)
-            l = font.render(lbl, True, Z_COLOR)
-            surface.blit(l, (rect.x + (rect.w - l.get_width()) // 2,
-                             rect.y + (rect.h - l.get_height()) // 2))
-        sv = font.render(f"{sensitivity[0]:.1f}x", True, Z_COLOR)
-        surface.blit(sv, (nav_sminus.x + nav_sminus.w + 4, nav_sminus.y + 7))
 
     while True:
         for event in pygame.event.get():
@@ -423,10 +443,6 @@ def main():
                     running = False
                     pygame.quit()
                     os.execv(sys.executable, [sys.executable, '/home/pi/projects/launcher.py'])
-                if nav_sminus.collidepoint(pos):
-                    sensitivity[0] = round(max(0.5, sensitivity[0] - 0.25), 2)
-                if nav_splus.collidepoint(pos):
-                    sensitivity[0] = round(sensitivity[0] + 0.25, 2)
                 if nav_cal_rect.collidepoint(pos):
                     cal_status['msg'] = 'calibrating...'
                     cal_status['until'] = time.monotonic() + 999

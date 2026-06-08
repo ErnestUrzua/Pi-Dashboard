@@ -1,0 +1,15 @@
+[Unit]
+Description=FFT Analyzer
+After=sound.target graphical.target
+Wants=graphical.target
+
+[Service]
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+ExecStart=/usr/bin/python3 /home/pi/projects/fft_analyzer.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

@@ -27,12 +27,13 @@ RING_SIZE  = 288000       # 6 seconds of audio history for waveform
 DISPLAY_W = 1024
 DISPLAY_H = 600
 FPS = 60
-BAR_COUNT = 120       # number of frequency bars
+BAR_COUNT = 120       # default number of frequency bars
+BAR_COUNT_OPTIONS = [120, 60, 30]
 MIN_FREQ = 20         # Hz
 MAX_FREQ = 20000      # Hz
 DB_MIN = -40          # dB floor
 DB_MAX = 0            # dB ceiling
-BASS_SHELF_DB  = 0    # disabled — calibration handles frequency correction
+BASS_SHELF_DB  = 6    # default bass shelf pre-cut (adjustable via SHELF +/- buttons)
 BASS_SHELF_HZ  = 500
 MIC_CAL_FILE   = '/home/pi/.config/fft_mic_cal.json'
 MIC_CAL_SECS   = 5    # seconds to average during calibration
@@ -125,7 +126,7 @@ def draw_particles(surface, energy, shape_mode):
             p.shape = shape_mode
         p.update(energy)
         col = colors[i % len(colors)]
-        alpha = min(255, int(p.alpha + energy * 170))
+        alpha = min(150, int((p.alpha + energy * 170) * 0.55))
         pygame.draw.polygon(overlay, (*col, alpha), [(int(x), int(y)) for x, y in p.points(energy)], 2)
     surface.blit(overlay, (0, 0))
 
@@ -143,7 +144,6 @@ def audio_callback(indata, frames, time, status):
         ring_buffer[-len(chunk):] = chunk
 
 GAIN = 150.0
-agc_peak = 0.001
 
 # Per-bar mic calibration correction (dB offset per bar, 0 = flat)
 import json as _json
@@ -158,18 +158,14 @@ mic_cal    = _load_mic_cal()
 cal_state  = {'running': False, 'accum': None, 'frames': 0, 'done_until': 0}
 
 def compute_fft(buffer, sample_rate):
-    global agc_peak
     windowed = buffer * np.hanning(FFT_SIZE)
     fft_data = np.abs(np.fft.rfft(windowed, n=FFT_SIZE)) * GAIN
-    peak = np.max(fft_data) if np.max(fft_data) > 0 else 1.0
-    agc_peak = peak if peak > agc_peak else agc_peak * 0.97
-    fft_data = (fft_data / agc_peak) * 1.2
-    freqs = np.fft.rfftfreq(len(buffer), d=1.0 / sample_rate)
-    fft_db = 20 * np.log10(np.maximum(fft_data, 1e-10))
+    freqs    = np.fft.rfftfreq(len(buffer), d=1.0 / sample_rate)
+    fft_db   = 20 * np.log10(np.maximum(fft_data, 1e-10))
     return freqs, fft_db
 
-def get_bar_values(freqs, fft_db, bar_count, min_freq, max_freq):
-    """Map FFT bins to log-spaced bars with bass shelf reduction."""
+def get_bar_values(freqs, fft_db, bar_count, min_freq, max_freq, shelf_db=0):
+    """Map FFT bins to log-spaced bars with optional bass shelf reduction."""
     log_freqs = np.logspace(np.log10(min_freq), np.log10(max_freq), bar_count + 1)
     bars = []
     for i in range(bar_count):
@@ -180,14 +176,16 @@ def get_bar_values(freqs, fft_db, bar_count, min_freq, max_freq):
             bars.append(DB_MIN)
     bars = np.array(bars)
 
-    # Bass shelf: taper cut from BASS_SHELF_DB at min_freq down to 0 at BASS_SHELF_HZ
-    centers = np.sqrt(log_freqs[:-1] * log_freqs[1:])
-    log_min   = np.log10(min_freq)
-    log_shelf = np.log10(BASS_SHELF_HZ)
-    t = np.clip((np.log10(centers) - log_min) / (log_shelf - log_min), 0.0, 1.0)
-    bars -= BASS_SHELF_DB * (1.0 - t)
-    bars += mic_cal   # apply per-bar mic correction
+    if shelf_db > 0:
+        centers   = np.sqrt(log_freqs[:-1] * log_freqs[1:])
+        log_min   = np.log10(min_freq)
+        log_shelf = np.log10(BASS_SHELF_HZ)
+        t = np.clip((np.log10(centers) - log_min) / (log_shelf - log_min), 0.0, 1.0)
+        bars -= shelf_db * (1.0 - t)
 
+    cal = mic_cal if len(mic_cal) == bar_count else np.interp(
+        np.linspace(0, 1, bar_count), np.linspace(0, 1, len(mic_cal)), mic_cal)
+    bars += cal
     return bars
 
 def db_to_height(db, display_h, db_min, db_max):
@@ -294,10 +292,11 @@ def main():
     font = pygame.font.Font("/home/pi/.fonts/Menlo.ttc", 12)
 
     # Smoothing buffers
-    smoothed_bars = np.full(BAR_COUNT, float(DB_MIN))
-    smoothed_wave = np.zeros(BAR_COUNT)
-    wave_agc_peak = 0.001
-    wave_display  = np.zeros(DISPLAY_W)   # smoothed y values for the trace
+    smoothed_bars  = np.full(BAR_COUNT, float(DB_MIN))
+    smoothed_wave  = np.zeros(BAR_COUNT)
+    wave_agc_peak  = 0.001
+    wave_display   = np.zeros(DISPLAY_W)
+    bar_agc_peak   = float(DB_MIN)   # tracks 95th-percentile bar level for display gain
     switcher = CardSwitcher(__file__, DISPLAY_W, DISPLAY_H)
     fft_smoothing  = 0.50
     wave_smoothing = 0.60
@@ -307,13 +306,14 @@ def main():
     bw = 68
     pad = 6
     x0 = DISPLAY_W - bw - pad
-    labels = ["HOME", "SLOW -", "SLOW +", "FFT/WAVE", "THEME", "SHAPES", "MIC CAL", "MIRROR"]
+    labels = ["HOME", "SLOW -", "SLOW +", "FFT/WAVE", "THEME", "SHAPES", "MIRROR", "BARS"]
     buttons = [
         (lbl, pygame.Rect(x0, DISPLAY_H - BAR_BASE_OFFSET - (i + 1) * (BTN_H + pad) - 20, bw, BTN_H))
         for i, lbl in enumerate(labels)
     ]
-    b_home, b_smooth_dn, b_smooth_up, b_mode, b_theme, b_shapes, b_mic_cal, b_mirror = [r for _, r in buttons]
-    mirrored = [True]
+    b_home, b_smooth_dn, b_smooth_up, b_mode, b_theme, b_shapes, b_mirror, b_bars = [r for _, r in buttons]
+    mirrored      = [True]
+    bar_count_idx = [0]
 
     # Find I2S device index (or use default)
     device_index = None
@@ -399,13 +399,12 @@ def main():
                     if hit(b_shapes, pos):
                         shape_idx = (shape_idx + 1) % len(shape_modes)
                         popup = (shape_modes[shape_idx].upper(), b_shapes, now)
-                    if hit(b_mic_cal, pos):
-                        if not cal_state['running']:
-                            start_mic_cal()
-                            popup = ("MIC CAL...", b_mic_cal, now)
                     if hit(b_mirror, pos):
                         mirrored[0] = not mirrored[0]
                         popup = ("MIRROR" if mirrored[0] else "NORMAL", b_mirror, now)
+                    if hit(b_bars, pos):
+                        bar_count_idx[0] = (bar_count_idx[0] + 1) % len(BAR_COUNT_OPTIONS)
+                        popup = (f"{BAR_COUNT_OPTIONS[bar_count_idx[0]]} BARS", b_bars, now)
                     if hit(b_home, pos):
                         pygame.quit()
                         os.execv(sys.executable, [sys.executable, '/home/pi/projects/launcher.py'])
@@ -426,24 +425,28 @@ def main():
             center_y = (DISPLAY_H - BAR_BASE_OFFSET) // 2 + DISPLAY_Y_OFFSET
 
             if mode == 'fft':
+                bc = BAR_COUNT_OPTIONS[bar_count_idx[0]]
+                if len(smoothed_bars) != bc:
+                    smoothed_bars = np.full(bc, float(DB_MIN))
+                    bar_agc_peak  = float(DB_MIN)
+
                 with ring_lock:
                     buf = ring_buffer[-FFT_SIZE:].copy()
                 freqs, fft_db = compute_fft(buf, SAMPLE_RATE)
-                bars = get_bar_values(freqs, fft_db, BAR_COUNT, MIN_FREQ, MAX_FREQ)
+                bars = get_bar_values(freqs, fft_db, bc, MIN_FREQ, MAX_FREQ, BASS_SHELF_DB)
                 smoothed_bars = smoothing * smoothed_bars + (1 - smoothing) * bars
 
-                if cal_state['running']:
-                    cal_state['accum']  += bars - mic_cal  # accumulate raw (pre-cal) bars
-                    cal_state['frames'] += 1
-                    frames_needed = int(MIC_CAL_SECS * FPS)
-                    if cal_state['frames'] >= frames_needed:
-                        finish_mic_cal()
-                        popup = ("MIC CAL DONE", b_mic_cal, pygame.time.get_ticks())
+                # Bar-level AGC: shift all bars so 95th-percentile nears the top
+                p95 = float(np.percentile(smoothed_bars, 95))
+                bar_agc_peak = p95 if p95 > bar_agc_peak else bar_agc_peak * 0.995
+                gain_shift = DB_MAX - 2 - bar_agc_peak
+                display_bars = smoothed_bars + gain_shift
 
                 draw_grid(screen, font, DISPLAY_W, DISPLAY_H)
-                bar_w = DISPLAY_W // BAR_COUNT
+                bar_w = DISPLAY_W // bc
                 bar_base_y = DISPLAY_H - BAR_BASE_OFFSET + DISPLAY_Y_OFFSET
-                for i, db in enumerate(smoothed_bars):
+
+                for i, db in enumerate(display_bars):
                     norm = (db - DB_MIN) / (DB_MAX - DB_MIN)
                     color = bar_color(np.clip(norm, 0, 1))
                     x = i * bar_w

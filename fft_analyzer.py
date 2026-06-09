@@ -32,8 +32,8 @@ MIN_FREQ = 20         # Hz
 MAX_FREQ = 20000      # Hz
 DB_MIN = -40          # dB floor
 DB_MAX = 0            # dB ceiling
-BASS_SHELF_DB  = 18   # max dB to cut at lowest frequencies
-BASS_SHELF_HZ  = 500  # frequency where bass cut tapers to zero
+BASS_SHELF_DB  = 0    # disabled — calibration handles frequency correction
+BASS_SHELF_HZ  = 500
 MIC_CAL_FILE   = '/home/pi/.config/fft_mic_cal.json'
 MIC_CAL_SECS   = 5    # seconds to average during calibration
 
@@ -270,9 +270,8 @@ def finish_mic_cal():
     if cal_state['frames'] < 1:
         return
     avg = cal_state['accum'] / cal_state['frames']
-    # Correction = -(avg - max(avg)) so quiet bars are boosted up to the peak, nothing gets cut
-    # Cap at 20 dB to avoid exploding bins where mic had no signal during calibration
-    correction = np.clip(-(avg - np.max(avg)), 0.0, 6.0)
+    # Flatten to mean: boosts dips, cuts peaks so pink noise displays flat
+    correction = -(avg - np.mean(avg))
     mic_cal = correction.astype(np.float32)
     try:
         with open(MIC_CAL_FILE, 'w') as f:
